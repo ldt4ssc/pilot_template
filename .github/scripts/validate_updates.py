@@ -10,6 +10,7 @@ update is invalid.
 This script is run by the validate-updates GitHub Actions workflow.
 """
 
+import datetime
 import json
 import re
 import sys
@@ -37,10 +38,8 @@ def find_update_files():
         return []
     files = []
     for path in sorted(UPDATES_DIR.rglob("*.md")):
-        # Skip files inside _examples/, _schema/, or any folder starting with _
         if any(part.startswith("_") for part in path.relative_to(UPDATES_DIR).parts):
             continue
-        # Skip the updates/README.md itself
         if path.name == "README.md":
             continue
         files.append(path)
@@ -53,36 +52,30 @@ def parse_front_matter(file_path):
     match = FRONT_MATTER_PATTERN.match(text)
     if not match:
         raise ValueError(
-            "File does not start with a valid YAML front matter block "
-            "(expected '---' on the first line, then YAML, then '---' "
-            "on a line by itself)."
+            "File does not start with a valid YAML front matter block. "
+            "Make sure the file begins with '---' on its own line, "
+            "followed by YAML fields, then '---' on its own line, "
+            "and only then the body of the update."
         )
     front_matter_text = match.group(1)
     try:
         front_matter = yaml.safe_load(front_matter_text)
     except yaml.YAMLError as e:
-        raise ValueError(f"YAML parse error in front matter: {e}")
+        raise ValueError(
+            f"YAML parse error in front matter: {e}. "
+            "Common causes: tabs instead of spaces, missing colons, "
+            "or unbalanced quotes."
+        )
     if not isinstance(front_matter, dict):
         raise ValueError(
-            "Front matter must be a YAML mapping (key-value pairs)."
+            "Front matter must be a YAML mapping (key-value pairs). "
+            "Check that each line follows the 'key: value' pattern."
         )
     return front_matter
 
 
-def load_schema(schema_version):
-    """Load the schema file matching the declared schema version."""
-    schema_path = SCHEMA_DIR / f"update-v{schema_version}.schema.json"
-    if not schema_path.is_file():
-        raise FileNotFoundError(
-            f"No schema file found for schema_version={schema_version} "
-            f"(expected at {schema_path.relative_to(REPO_ROOT)})."
-        )
-    with schema_path.open(encoding="utf-8") as f:
-        return json.load(f)
-
 def normalise_for_schema(value):
     """Recursively convert YAML-parsed dates and datetimes to ISO strings."""
-    import datetime
     if isinstance(value, datetime.datetime):
         return value.isoformat()
     if isinstance(value, datetime.date):
@@ -93,41 +86,137 @@ def normalise_for_schema(value):
         return [normalise_for_schema(v) for v in value]
     return value
 
+
+def load_schema(schema_version):
+    """Load the schema file matching the declared schema version."""
+    schema_path = SCHEMA_DIR / f"update-v{schema_version}.schema.json"
+    if not schema_path.is_file():
+        raise FileNotFoundError(
+            f"No schema file found for schema_version={schema_version}. "
+            f"Expected to find {schema_path.relative_to(REPO_ROOT)}. "
+            "If you are using a newer schema version, make sure the "
+            "corresponding schema file is present in the repository."
+        )
+    with schema_path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
 def validate_filename(file_path):
     """Check that the filename follows the YYYY-MM-DD-short-title.md pattern."""
     if not FILENAME_PATTERN.match(file_path.name):
         raise ValueError(
-            f"Filename does not match the required pattern "
-            f"'YYYY-MM-DD-short-title.md' (lowercase, hyphens, no spaces)."
+            f"Filename '{file_path.name}' does not match the required pattern. "
+            "Filenames must follow 'YYYY-MM-DD-short-title.md' — a date in "
+            "ISO format, a descriptive slug in lowercase with hyphens, and "
+            "the .md extension. Example: 2026-03-14-first-integration.md."
         )
+
+
+def humanise_error(err, front_matter):
+    """Turn a jsonschema ValidationError into a clearer message for pilots."""
+    path = ".".join(str(p) for p in err.absolute_path) or "(root)"
+    validator = err.validator
+    validator_value = err.validator_value
+
+    # Friendlier messages for the common cases
+    if validator == "enum":
+        field = err.absolute_path[-1] if err.absolute_path else "(root)"
+        allowed = ", ".join(repr(v) for v in validator_value)
+        return (
+            f"Field '{field}' has value {err.instance!r}, which is not allowed. "
+            f"Allowed values are: {allowed}."
+        )
+
+    if validator == "required":
+        missing = validator_value
+        if isinstance(validator_value, list):
+            # Find which specific field is missing
+            present = set(err.instance.keys()) if isinstance(err.instance, dict) else set()
+            missing = [f for f in validator_value if f not in present]
+            missing_str = ", ".join(missing) if missing else ", ".join(validator_value)
+            return f"Required field(s) missing at '{path}': {missing_str}."
+        return f"Required field missing at '{path}': {validator_value}."
+
+    if validator == "type":
+        expected = validator_value
+        got = type(err.instance).__name__
+        return (
+            f"Field at '{path}' should be of type {expected!r}, "
+            f"but got {got} ({err.instance!r})."
+        )
+
+    if validator == "format":
+        expected = validator_value
+        hints = {
+            "date": "a date in ISO format (YYYY-MM-DD, e.g. 2026-03-14)",
+            "uri": "a full URL including the scheme (e.g. https://example.org/...)",
+        }
+        hint = hints.get(expected, f"format '{expected}'")
+        return f"Field at '{path}' must be {hint}. Got {err.instance!r}."
+
+    if validator == "pattern":
+        return (
+            f"Field at '{path}' has value {err.instance!r}, which does not match "
+            f"the required pattern. For tags, use lowercase letters, numbers, "
+            f"and hyphens only (e.g. 'air-quality', not 'Air Quality')."
+        )
+
+    if validator == "minLength":
+        return (
+            f"Field at '{path}' is too short ({len(err.instance)} characters). "
+            f"It must have at least {validator_value} characters."
+        )
+
+    if validator == "maxLength":
+        return (
+            f"Field at '{path}' is too long ({len(err.instance)} characters). "
+            f"It must have at most {validator_value} characters."
+        )
+
+    if validator == "const":
+        return (
+            f"Field at '{path}' has value {err.instance!r}, but must be exactly "
+            f"{validator_value!r} for this schema version."
+        )
+
+    if validator == "additionalProperties":
+        match = re.search(r"\('(.+?)' was unexpected\)", err.message)
+        if match:
+            unexpected = match.group(1)
+            return (
+                f"Unexpected field '{unexpected}'{' at ' + path if path != '(root)' else ''}. "
+                "Check for typos — field names are case-sensitive and must match "
+                "the schema exactly."
+            )
+
+    # Fallback: raw jsonschema message
+    return f"Schema error at '{path}': {err.message}"
 
 
 def validate_file(file_path):
     """Validate a single update file. Returns a list of error messages."""
     errors = []
-    rel_path = file_path.relative_to(REPO_ROOT)
 
-    # Filename check
     try:
         validate_filename(file_path)
     except ValueError as e:
-        errors.append(f"  Filename: {e}")
+        errors.append(f"  {e}")
 
-    # Front matter parse
     try:
         front_matter = parse_front_matter(file_path)
     except ValueError as e:
         errors.append(f"  {e}")
-        return errors  # Cannot proceed without parsed front matter
+        return errors
 
-    # Normalise values that YAML parses into native Python types
-    # but which our schema expects as strings (dates, datetimes).
     front_matter = normalise_for_schema(front_matter)
 
-    # Schema version routing
     schema_version = front_matter.get("schema_version")
     if schema_version is None:
-        errors.append("  Missing required field: schema_version")
+        errors.append(
+            "  Missing required field 'schema_version'. "
+            "All updates must declare a schema version. For the current "
+            "schema, use 'schema_version: 1'."
+        )
         return errors
 
     try:
@@ -136,14 +225,26 @@ def validate_file(file_path):
         errors.append(f"  {e}")
         return errors
 
-    # Schema validation
     validator = Draft202012Validator(schema)
-    schema_errors = sorted(validator.iter_errors(front_matter), key=lambda e: e.path)
+    schema_errors = sorted(validator.iter_errors(front_matter), key=lambda e: list(e.path))
     for err in schema_errors:
-        path = ".".join(str(p) for p in err.absolute_path) or "(root)"
-        errors.append(f"  Schema error at '{path}': {err.message}")
+        errors.append(f"  {humanise_error(err, front_matter)}")
 
     return errors
+
+
+def print_footer_on_failure():
+    """Print a helpful pointer to examples and support when validation fails."""
+    print("-" * 72)
+    print(
+        "For help, see:\n"
+        "  - The worked examples in updates/_examples/\n"
+        "  - The update schema at updates/_schema/update-v1.schema.json\n"
+        "  - The full guidance in the LDT4SSC Pilot Update Guide\n"
+        "  - The LDT4SSC Help Desk if you are stuck."
+    )
+    print("-" * 72)
+
 
 def main():
     files = find_update_files()
@@ -169,6 +270,7 @@ def main():
     print()
     if total_errors:
         print(f"Validation failed with {total_errors} error(s).")
+        print_footer_on_failure()
         return 1
     else:
         print("All updates valid.")
