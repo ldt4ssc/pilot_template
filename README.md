@@ -1,5 +1,7 @@
 # LDT4SSC Pilot Project Repository
 
+` < change as necessary > `
+
 This repository is the home of an **LDT4SSC pilot project**. It contains the
 pilot's documentation, shared artefacts, and ongoing updates, and serves as the
 canonical public record of the pilot's work within the LDT4SSC initiative.

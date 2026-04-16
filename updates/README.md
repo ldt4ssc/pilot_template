@@ -100,7 +100,7 @@ is wrong with it. Common issues:
 
 See the Pilot Update Guide annex of the LDT4SSC onboarding package for
 detailed guidance. If the error message is not clear, contact the LDT4SSC
-Help Desk.
+**[Helpdesk](mailto:info@ldt4ssc.eu)**.
 
 ## The `_examples/` and `_schema/` folders
 
